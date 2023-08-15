@@ -1,0 +1,569 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Creates ELB and ASG with PHP FrontEnd instances and MultiAZ DB
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: ELB Network Configuration
+        Parameters:
+          - VPC
+          - ELBSubnets
+          - ELBName
+          - ELBListenerPort
+          - ELBCertificate
+      - Label:
+          default: DB Configuration
+        Parameters:
+          - DBNameFE
+          - DBSubnets
+          - DBAllocatedStorage
+          - DBStorageEncrypted
+          - DBMasterUsername
+          - DBPort
+      - Label:
+          default: EC2 Instances Configuration
+        Parameters:
+          - InstanceSubnets
+          - InstanceName
+          - InstanceType
+          - InstanceIAMRoleName
+          - EnableVolumeEncryption
+          - InstanceListenPort
+      - Label:
+          default: Auto Scaling Configuration
+        Parameters:
+          - MinInstances
+          - MaxInstances
+      - Label:
+          default: Security Group Configuration
+        Parameters:
+          - SourcePort
+          - SourceIP
+    ParameterLabels:
+      VPC:
+        default: VPC
+      ELBSubnets:
+        default: ELB Subnets
+      InstanceName:
+        default: Instance Name
+      InstanceSubnets:
+        default: Instance Subnets
+      InstanceIAMRoleName:
+        default: Instance IAM role name (e.g. SSM Role)
+      InstanceType:
+        default: Instance Type
+      EnableVolumeEncryption:
+        default: Enable instance volume encryption
+      InstanceListenPort:
+        default: Instance Listener Port (default 80)
+      MinInstances:
+        default: Minimum instance running
+      MaxInstances:
+        default: Maximum instance running
+      ELBName:
+        default: ELB Name
+      ELBListenerPort:
+        default: ELB Listener Port
+      ELBCertificate:
+        default: ARN of the ELB certificate it TLS is used
+      SourcePort:
+        default: Front End Listen Port
+      SourceIP:
+        default: Allowed client CIDRs
+      DBSubnets:
+        default: DB Subnets
+      DBAllocatedStorage:
+        default: DB Storage
+      DBNameFE:
+        default: DB Name
+      DBStorageEncrypted:
+        default: DB Storage Encryption
+      DBMasterUsername:
+        default: DB Master Username
+      DBPort:
+        default: DB Port
+Parameters:
+  VPC:
+    Description: Select an existing VPC.
+    Type: AWS::EC2::VPC::Id
+    MinLength: "1"
+  ELBSubnets:
+    Description: Select at least 2 public subnets in the VPC for ELB usage.
+    Type: List<AWS::EC2::Subnet::Id>
+    MinLength: "2"
+  DBSubnets:
+    Description: Select at least 2 private subnets in the VPC for DB usage.
+    Type: List<AWS::EC2::Subnet::Id>
+    MinLength: "2"
+  DBAllocatedStorage:
+    Description: Enter storage amount in GiB
+    Type: Number
+    Default: "20"
+  DBNameFE:
+    Description: Enter DB Name
+    Type: String
+    Default: dbfe
+  DBStorageEncrypted:
+    Description: DB Storage Encrytion
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - true
+      - false
+  DBMasterUsername:
+    Description: DB Master Username
+    Type: String
+    Default: "dbadmin"
+  DBPort:
+    Description: DB Port
+    Type: Number
+    Default: "3306"
+  InstanceSubnets:
+    Description: Select at least 2 internal subnets in the VPC for Instances.
+    Type: List<AWS::EC2::Subnet::Id>
+    MinLength: "2"
+  InstanceName:
+    Description: Instance Name (default i-fe-php).
+    Type: String
+    Default: i-fe-php
+  InstanceType:
+    Description: Select instance type to launch
+    Type: String
+    Default: t3.micro
+    AllowedValues:
+      - t2.micro
+      - t2.small
+      - t2.medium
+      - t2.large
+      - t3.micro
+      - t3.small
+      - t3.medium
+      - t3.large
+      - t3a.micro
+      - t3a.small
+      - t3a.medium
+      - t3a.large
+      - t4g.micro
+      - t4g.micro
+      - t4g.micro
+      - t4g.large
+    ConstraintDescription: must be a valid EC2 instance type.
+  InstanceListenPort:
+    Description: Instance Listener Port (default 80)
+    Type: Number
+    Default: "80"
+  InstanceIAMRoleName:
+    Description: IAM Role to attach to instance (i.e. SSM Role)
+    Type: String
+    Default: ""
+  LatestAmazon2AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: "/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2"
+  EnableVolumeEncryption:
+    Description: Encrypt Auto Scaling instances volume with default AWS KMS key.
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - true
+      - false
+  MinInstances:
+    Description: The minimal number of instances in the Auto Scaling group.
+    Type: Number
+    Default: "2"
+    MinValue: "2"
+  MaxInstances:
+    Description: The maximal number of instances in the Auto Scaling group.
+    Type: Number
+    Default: "10"
+    MinValue: "2"
+  ELBName:
+    Description: ELB Name
+    Type: String
+    Default: elb-fe
+  ELBListenerPort:
+    Description: ELB Listener Port
+    Type: Number
+    Default: "443"
+  ELBCertificate:
+    Description: Certficate ARN for TLS listener
+    Type: String
+  SourceIP:
+    Description: Client IPs that will have access to FrontEnd.
+    Type: String
+    Default: 0.0.0.0/0
+    AllowedPattern: "^(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})/(\\d{1,2})$"
+Conditions:
+  isIAMRoleName:
+    Fn::Not:
+      - Fn::Equals:
+          - !Ref InstanceIAMRoleName
+          - ""
+Resources:
+  ###########################
+  ####  ELB Configuration ###
+  ###########################
+  ELBFrontEnd:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: elb-fe
+      Scheme: internet-facing
+      Type: application
+      IpAddressType: ipv4
+      Subnets: !Ref ELBSubnets
+      LoadBalancerAttributes:
+        - Key: load_balancing.cross_zone.enabled
+          Value: "true"
+        - Key: routing.http.preserve_host_header.enabled
+          Value: "true"
+        - Key: routing.http.xff_client_port.enabled
+          Value: "true"
+      SecurityGroups:
+        - !Ref ELBSecurityGroup
+  ELBFrontEndTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckEnabled: true
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 5
+      UnhealthyThresholdCount: 3
+      HealthCheckPath: "/"
+      Matcher:
+        HttpCode: "200"
+      Name: tg-frontend-http
+      Port: !Ref InstanceListenPort
+      Protocol: HTTP
+      TargetGroupAttributes:
+        - Key: stickiness.enabled
+          Value: "true"
+        - Key: stickiness.type
+          Value: lb_cookie
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: tg-frontend-http
+  ELBFronEndListener:
+    DependsOn: ELBFrontEnd
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - TargetGroupArn: !Ref ELBFrontEndTargetGroup
+          Type: forward
+      LoadBalancerArn: !Ref ELBFrontEnd
+      Port: !Ref ELBListenerPort
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !Ref ELBCertificate
+  ELBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ELB Security Group
+      Tags:
+        - Key: Name
+          Value: !Join
+            - "-"
+            - - "sgr-elb"
+              - !Ref AWS::StackName
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          CidrIp: !Ref SourceIP
+          FromPort: !Ref ELBListenerPort
+          ToPort: !Ref ELBListenerPort
+  ####################################
+  ####  DB Cluster Configuration  ####
+  ####################################
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: dbsubnetgroup
+      DBSubnetGroupDescription: DB SubnetGroup.
+      SubnetIds: !Ref DBSubnets
+  DBMutliAZ:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    Properties:
+      AllocatedStorage: !Ref DBAllocatedStorage
+      DBName: !Ref DBNameFE
+      DBInstanceClass: "db.m6gd.large"
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      Engine: "mysql"
+      EngineVersion: "8.0.33"
+      MasterUsername: !Ref DBMasterUsername
+      ManageMasterUserPassword: True
+      MultiAZ: True
+      PubliclyAccessible: False
+      Port: !Ref DBPort
+      StorageType: gp2
+      StorageEncrypted: !Ref DBStorageEncrypted
+      VPCSecurityGroups:
+        - !Ref DBSecurityGroup
+  DBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Join
+            - "-"
+            - - "sgr-db"
+              - !Ref AWS::StackName
+      GroupDescription: DB security group.
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          SourceSecurityGroupId: !Ref FrontEndSecurityGroup
+          FromPort: !Ref DBPort
+          ToPort: !Ref DBPort
+  #################################
+  ####  FrontEnd Configuration ####
+  #################################
+  FrontEndSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Join
+            - "-"
+            - - "sgr-i"
+              - !Ref AWS::StackName
+      GroupDescription: FrontEnd security group for ELB.
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          CidrIp: !Ref SourceIP
+          FromPort: !Ref InstanceListenPort
+          ToPort: !Ref InstanceListenPort
+  ASGFrontEndGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn: FrontEndTemplate
+    Properties:
+      AutoScalingGroupName: asg-fe
+      VPCZoneIdentifier: !Ref InstanceSubnets
+      LaunchTemplate:
+        LaunchTemplateId: !Ref FrontEndTemplate
+        Version:
+          Fn::GetAtt:
+            - FrontEndTemplate
+            - LatestVersionNumber
+      MinSize: !Ref MinInstances
+      MaxSize: !Ref MaxInstances
+      DesiredCapacity: !Ref MinInstances
+      TargetGroupARNs:
+        - !Ref ELBFrontEndTargetGroup
+      Tags:
+        - Key: Name
+          Value: !Ref InstanceName
+          PropagateAtLaunch: true
+  FrontEndTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    DependsOn: FrontEndSecurityGroup
+    # Metadata:
+    #   AWS::CloudFormation::Init:
+    #     configSets:
+    #       Install:
+    #         - Install
+    #     Install:
+    #       files:
+    #         /etc/httpd/conf.d/virtualhosts.conf:
+    #           content: !Join
+    #             - ""
+    #             - - |
+    #                 <VirtualHost *:80>
+    #               - |2
+    #                   ServerAdmin webmaster@localhost
+    #               - |2
+    #                   DocumentRoot /var/www/html
+    #               - |2
+    #                   ErrorLog /var/www/html/logs/error.log
+    #               - |2
+    #                   CustomLog /var/www/html/logs/access.log combined
+    #               - |
+    #                 </VirtualHost>
+    #         /var/www/html/db.mysql:
+    #           mode: "000644"
+    #           owner: "ec2-user"
+    #           group: "www"
+    #           content: !Join
+    #             - ""
+    #             - - |
+    #                 <html>
+    #               - |2
+    #                   <head>
+    #               - |2
+    #                     <title>AWS CloudFormation PHP Sample</title>
+    #               - |2
+    #                     <meta http-equiv="Content-Type" content="text/html; charset=ISO-8859-1">
+    #               - |2
+    #                   </head>
+    #               - |2
+    #                   <body>
+    #               - |2
+    #                     <h1>Welcome to the AWS CloudFormation PHP Sample</h1>
+    #               - |2
+    #                     <p/>
+    #               - |2
+    #                     <?php
+    #               - |2
+    #                       // Print out the current data and time
+    #               - |2
+    #                       print "The Current Date and Time is: <br/>";
+    #               - |2
+    #                       print date("g:i A l, F j Y.");
+    #               - |2
+    #                     ?>
+    #               - |2
+    #                     <p/>
+    #               - |2
+    #                     <?php
+    #               - |2
+    #                       // Setup a handle for CURL
+    #               - |2
+    #                       $curl_handle=curl_init();
+    #               - |2
+    #                       curl_setopt($curl_handle,CURLOPT_CONNECTTIMEOUT,2);
+    #               - |2
+    #                       curl_setopt($curl_handle,CURLOPT_RETURNTRANSFER,1);
+    #               - |2
+    #                       // Get the hostname of the instance from the instance metadata
+    #               - |2
+    #                       curl_setopt($curl_handle,CURLOPT_URL,'http://169.254.169.254/latest/meta-data/public-hostname');
+    #               - |2
+    #                       $hostname = curl_exec($curl_handle);
+    #               - |2
+    #                       if (empty($hostname))
+    #               - |2
+    #                       {
+    #               - |2
+    #                         print "Sorry, for some reason, we got no hostname back <br />";
+    #               - |2
+    #                       }
+    #               - |2
+    #                       else
+    #               - |2
+    #                       {
+    #               - |2
+    #                         print "Server = " . $hostname . "<br />";
+    #               - |2
+    #                       }
+    #               - |2
+    #                       // Get the instance-id of the instance from the instance metadata
+    #               - |2
+    #                       curl_setopt($curl_handle,CURLOPT_URL,'http://169.254.169.254/latest/meta-data/instance-id');
+    #               - |2
+    #                       $instanceid = curl_exec($curl_handle);
+    #               - |2
+    #                       if (empty($instanceid))
+    #               - |2
+    #                       {
+    #               - |2
+    #                         print "Sorry, for some reason, we got no instance id back <br />";
+    #               - |2
+    #                       }
+    #               - |2
+    #                       else
+    #               - |2
+    #                       {
+    #               - |2
+    #                         print "EC2 instance-id = " . $instanceid . "<br />";
+    #               - |2
+    #                       }
+    #               - '      $Database   = "'
+    #               - !GetAtt DBMutliAZ.Endpoint.Address
+    #               - |
+    #                 ";
+    #               - '      $DBUser     = "'
+    #               - !Ref DBMasterUsername
+    #               - |
+    #                 ";
+    #               - '      $DBPassword = "'
+    #               - !Join [
+    #                   "",
+    #                   [
+    #                     "{{resolve:secretsmanager:",
+    #                     !GetAtt DBMutliAZ.MasterUserSecret.SecretArn,
+    #                     ":SecretString:password}}",
+    #                   ],
+    #                 ]
+    #               - |
+    #                 ";
+    #               - |2
+    #                       print "Database = " . $Database . "<br />";
+    #               - |2
+    #                       $dbconnection = mysql_connect($Database, $DBUser, $DBPassword)
+    #               - |2
+    #                                       or die("Could not connect: " . mysql_error());
+    #               - |2
+    #                       print ("Connected to $Database successfully");
+    #               - |2
+    #                       mysql_close($dbconnection);
+    #               - |2
+    #                     ?>
+    #               - |2
+    #                     <h2>PHP Information</h2>
+    #               - |2
+    #                     <p/>
+    #               - |2
+    #                     <?php
+    #               - |2
+    #                       phpinfo();
+    #               - |2
+    #                     ?>
+    #               - |2
+    #                   </body>
+    #               - |
+    #                 </html>
+    #       services:
+    #         sysvinit:
+    #           httpd:
+    #             enabled: "true"
+    #             ensureRunning: "true"
+    Properties:
+      LaunchTemplateData:
+        Monitoring:
+          Enabled: true
+        ImageId: !Ref LatestAmazon2AmiId
+        InstanceType: !Ref InstanceType
+        BlockDeviceMappings:
+          - DeviceName: "/dev/xvda"
+            Ebs:
+              VolumeType: gp3
+              Encrypted: !Ref EnableVolumeEncryption
+        IamInstanceProfile:
+          Name: !Ref InstanceIAMRoleName
+        MetadataOptions:
+          HttpProtocolIpv6: disabled
+          HttpTokens: required
+        NetworkInterfaces:
+          - AssociatePublicIpAddress: false
+            DeviceIndex: 0
+            Groups:
+              - !Ref FrontEndSecurityGroup
+        UserData:
+          Fn::Base64: !Join
+            - ""
+            - - |
+                #!/bin/bash -xe
+              - |
+                yum update -y
+                yum install php php-mysql httpd -y
+                systemctl enable httpd
+                systemctl start httpd
+                groupadd www
+                usermod -a -G www ec2-user
+                chown -R root:www /var/www
+                chmod 2775 /var/www
+                find /var/www -type d -exec chmod 2775 {} +
+                find /var/www -type f -exec chmod 0664 {} +
+                mkdir /var/www/html/logs
+                touch /var/www/html/db_connect.mysql
+                cat > /var/www/html/db_connect.mysql << EOF
+              - "Database = "
+              - !GetAtt DBMutliAZ.Endpoint.Address
+              - "\n"
+              - "DBUser = "
+              - !Ref DBMasterUsername
+              - "\n"
+              - "DBPassword = "
+              - !GetAtt DBMutliAZ.MasterUserSecret.SecretArn
+              - "\n"
+              - EOF
